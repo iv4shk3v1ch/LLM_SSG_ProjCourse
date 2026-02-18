@@ -1,0 +1,32 @@
+{
+  "site": {
+    "name": "Jane Doe Portfolio",
+    "type": "portfolio migration",
+    "theme": "minimal-clean",
+    "deployment_target": "Netlify",
+    "base_url": "https://portfolio.example.com"
+  },
+  "ssg": {
+    "preferred": "hugo",
+    "candidates": ["hugo", "eleventy", "zola", "pelican"]
+  },
+  "nav": [
+    {"label": "Home", "url": "/"},
+    {"label": "Projects", "url": "/projects/"},
+    {"label": "About", "url": "/about/"},
+    {"label": "Contact", "url": "/contact/"}
+  ],
+  "pages": [
+    {"title": "Home", "slug": "", "placeholder": "Portfolio landing text goes here."},
+    {"title": "Projects", "slug": "projects", "placeholder": "Projects overview text goes here."},
+    {"title": "About", "slug": "about", "placeholder": "About text goes here."},
+    {"title": "Contact", "slug": "contact", "placeholder": "Contact details go here."}
+  ],
+  "migration": {
+    "source_pages": [
+      {"title": "Legacy About", "source_path": "/about", "target_slug": "about", "text_file": "migration_text/portfolio_about.txt"},
+      {"title": "Legacy Projects", "source_path": "/work", "target_slug": "projects", "text_file": "migration_text/portfolio_projects.txt"}
+    ]
+  }
+}
+

@@ -1,0 +1,1 @@
+This is existing user-provided About text wrapped into static frontmatter.

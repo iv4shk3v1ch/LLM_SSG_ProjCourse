@@ -1,0 +1,28 @@
+{
+  "site": {
+    "name": "Product Launch Landing",
+    "type": "marketing landing page",
+    "theme": "conversion-focused",
+    "deployment_target": "Cloudflare Pages",
+    "base_url": "https://launch.example.com"
+  },
+  "ssg": {
+    "preferred": "eleventy",
+    "candidates": ["eleventy", "hugo", "zola", "pelican"]
+  },
+  "nav": [
+    {"label": "Home", "url": "/"},
+    {"label": "Features", "url": "/features/"},
+    {"label": "Pricing", "url": "/pricing/"},
+    {"label": "FAQ", "url": "/faq/"},
+    {"label": "CTA", "url": "/cta/"}
+  ],
+  "pages": [
+    {"title": "Home", "slug": "", "placeholder": "Landing hero text goes here."},
+    {"title": "Features", "slug": "features", "placeholder": "Feature section text goes here."},
+    {"title": "Pricing", "slug": "pricing", "placeholder": "Pricing summary text goes here."},
+    {"title": "FAQ", "slug": "faq", "placeholder": "FAQ intro text goes here."},
+    {"title": "CTA", "slug": "cta", "placeholder": "Call-to-action text goes here."}
+  ]
+}
+

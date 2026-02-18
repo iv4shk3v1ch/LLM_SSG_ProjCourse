@@ -1,0 +1,1 @@
+This is existing user-provided Projects text wrapped into static frontmatter.

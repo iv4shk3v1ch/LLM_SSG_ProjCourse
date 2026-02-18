@@ -1,0 +1,28 @@
+{
+  "site": {
+    "name": "Computational Systems Research Group",
+    "type": "academic group site",
+    "theme": "lab-classic",
+    "deployment_target": "GitHub Pages",
+    "base_url": "https://lab.example.edu"
+  },
+  "ssg": {
+    "preferred": "zola",
+    "candidates": ["hugo", "zola", "eleventy", "pelican"]
+  },
+  "nav": [
+    {"label": "Home", "url": "/"},
+    {"label": "People", "url": "/people/"},
+    {"label": "Publications", "url": "/publications/"},
+    {"label": "Projects", "url": "/projects/"},
+    {"label": "Contact", "url": "/contact/"}
+  ],
+  "pages": [
+    {"title": "Home", "slug": "", "placeholder": "Research group landing text goes here."},
+    {"title": "People", "slug": "people", "placeholder": "Team member list text goes here."},
+    {"title": "Publications", "slug": "publications", "placeholder": "Publication list intro text goes here."},
+    {"title": "Projects", "slug": "projects", "placeholder": "Project catalog text goes here."},
+    {"title": "Contact", "slug": "contact", "placeholder": "Contact and location text goes here."}
+  ]
+}
+

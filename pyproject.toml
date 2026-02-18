@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ssg-case-tool"
+version = "0.1.0"
+description = "LLM-assisted SSG scaffolding + energy-aware instrumentation prototype"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+ssg-case = "ssg_case_tool.cli:main"

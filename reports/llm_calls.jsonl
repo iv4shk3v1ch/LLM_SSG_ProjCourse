@@ -1,0 +1,1 @@
+{"metric_type": "llm_call", "timestamp_utc": "2026-02-18T14:01:05.865970+00:00", "session": "portfolio", "step": "scaffold", "model": "gpt-4.1", "prompt_tokens": 1200, "completion_tokens": 300, "total_tokens": 1500, "prompt_chars": null}
