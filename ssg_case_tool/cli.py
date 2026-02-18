@@ -14,6 +14,13 @@ from .reporting import combine_report, render_markdown_summary
 from .scaffold import SUPPORTED_SSGS, scaffold_project
 from .utils import dump_json, load_json, load_spec
 
+DEFAULT_BUILD_COMMANDS: dict[str, str] = {
+    "hugo": "hugo --minify",
+    "eleventy": "npx @11ty/eleventy",
+    "zola": "zola build",
+    "pelican": "pelican content -o output -s pelicanconf.py",
+}
+
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -36,7 +43,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_build = sub.add_parser("measure-build", help="Run build and record duration/cpu/energy proxy.")
     p_build.add_argument("--project", required=True, type=Path, help="Project directory.")
-    p_build.add_argument("--build-command", required=True, help="Build command, e.g. 'hugo'.")
+    p_build.add_argument("--ssg", choices=sorted(SUPPORTED_SSGS), help="SSG for default build command.")
+    p_build.add_argument("--build-command", help="Build command override, e.g. 'hugo --minify'.")
+    p_build.add_argument("--artifact-dir", type=Path, help="Build output directory override.")
     p_build.add_argument("--cpu-watts", type=float, default=35.0, help="CPU watts for energy proxy.")
     p_build.add_argument("--shell", action="store_true", help="Run command via shell.")
     p_build.add_argument("--out", required=True, type=Path, help="Build metric output JSON path.")
@@ -53,8 +62,17 @@ def _build_parser() -> argparse.ArgumentParser:
     p_runtime = sub.add_parser(
         "measure-runtime", help="Measure static URL and optional dynamic URL latency/transfer proxy."
     )
-    p_runtime.add_argument("--static-url", required=True, help="Static hosted site URL.")
-    p_runtime.add_argument("--dynamic-url", help="Dynamic site URL.")
+    static_source = p_runtime.add_mutually_exclusive_group(required=True)
+    static_source.add_argument("--static-url", help="Static hosted site URL.")
+    static_source.add_argument("--static-dir", type=Path, help="Local static artifact directory to serve temporarily.")
+    dynamic_source = p_runtime.add_mutually_exclusive_group(required=False)
+    dynamic_source.add_argument("--dynamic-url", help="Dynamic site URL.")
+    dynamic_source.add_argument(
+        "--dynamic-local",
+        action="store_true",
+        help="Run a temporary local dynamic endpoint serving the same HTML payload.",
+    )
+    p_runtime.add_argument("--local-host", default="127.0.0.1", help="Host interface for temporary local servers.")
     p_runtime.add_argument("--runs", type=int, default=5, help="Number of runs per URL.")
     p_runtime.add_argument("--timeout-sec", type=float, default=10.0, help="Request timeout per run.")
     p_runtime.add_argument("--out", required=True, type=Path, help="Runtime metric output JSON.")
@@ -80,6 +98,18 @@ def _maybe_load(path: Path | None) -> dict[str, Any] | None:
     return load_json(path)
 
 
+def _infer_ssg_from_project(project: Path) -> str | None:
+    if (project / "pelicanconf.py").exists():
+        return "pelican"
+    if (project / ".eleventy.js").exists():
+        return "eleventy"
+    if (project / "templates").exists() and (project / "content").exists():
+        return "zola"
+    if (project / "layouts").exists() and (project / "content").exists():
+        return "hugo"
+    return None
+
+
 def main() -> None:
     parser = _build_parser()
     args = parser.parse_args()
@@ -100,14 +130,29 @@ def main() -> None:
         return
 
     if args.cmd == "measure-build":
+        inferred_ssg = args.ssg or _infer_ssg_from_project(args.project)
+        selected_command = args.build_command
+        if not selected_command and inferred_ssg:
+            selected_command = DEFAULT_BUILD_COMMANDS[inferred_ssg]
+        if not selected_command:
+            raise SystemExit(
+                "Unable to determine build command. Pass --build-command or --ssg for a known default."
+            )
+
         metric = run_build_measurement(
-            command=args.build_command,
+            command=selected_command,
             project_dir=args.project,
             cpu_watt_assumption=args.cpu_watts,
             shell=args.shell,
+            ssg=inferred_ssg,
+            artifact_dir=args.artifact_dir,
         )
         dump_json(args.out, metric)
         print(f"Build metric written: {args.out}")
+        if metric.get("warnings"):
+            print("Build warnings:")
+            for warning in metric["warnings"]:
+                print(f"- {warning}")
         if metric["exit_code"] != 0:
             raise SystemExit(metric["exit_code"])
         return
@@ -126,9 +171,14 @@ def main() -> None:
         return
 
     if args.cmd == "measure-runtime":
+        if args.dynamic_local and not args.static_dir:
+            raise SystemExit("--dynamic-local requires --static-dir.")
         metric = measure_runtime_comparison(
             static_url=args.static_url,
+            static_dir=args.static_dir,
             dynamic_url=args.dynamic_url,
+            dynamic_local=args.dynamic_local,
+            local_host=args.local_host,
             runs=args.runs,
             timeout_sec=args.timeout_sec,
         )

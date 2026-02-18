@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import functools
 import json
 import shlex
 import statistics
 import subprocess
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib import request
@@ -16,60 +19,102 @@ except ImportError:  # pragma: no cover
 
 from .utils import now_iso
 
+DEFAULT_BUILD_ARTIFACT_DIRS = {
+    "hugo": "public",
+    "eleventy": "_site",
+    "zola": "public",
+    "pelican": "output",
+}
+
+PLACEHOLDER_TOKEN_MARKERS = {
+    "echo",
+    "printf",
+    "write-host",
+    "write-output",
+}
+
 
 def run_build_measurement(
     command: str,
     project_dir: Path,
     cpu_watt_assumption: float = 35.0,
     shell: bool = False,
+    ssg: str | None = None,
+    artifact_dir: Path | None = None,
 ) -> dict[str, Any]:
     started_at = now_iso()
     start = time.perf_counter()
 
+    warnings: list[str] = _placeholder_command_warnings(command)
     args: str | list[str] = command if shell else shlex.split(command, posix=False)
-    if psutil is not None:
-        process = psutil.Popen(
-            args,
-            cwd=str(project_dir),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            shell=shell,
-        )
-        stdout, stderr = process.communicate()
-        exit_code = int(process.returncode)
-    else:
-        process = subprocess.Popen(
-            args,
-            cwd=str(project_dir),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            shell=shell,
-        )
-        stdout, stderr = process.communicate()
-        exit_code = int(process.returncode)
-    end = time.perf_counter()
-    wall_seconds = end - start
+    process: Any | None = None
+    stdout = ""
+    stderr = ""
+    exit_code = 127
+    spawn_error: str | None = None
+    monitored_cpu_seconds: float | None = None
+    monitored_pids: list[int] = []
 
-    cpu_seconds: float | None
-    if psutil is None:
+    try:
+        if psutil is not None:
+            process = psutil.Popen(
+                args,
+                cwd=str(project_dir),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                shell=shell,
+            )
+            monitored_cpu_seconds, monitored_pids = _monitor_cpu_seconds(process)
+            stdout, stderr = process.communicate()
+            exit_code = int(process.returncode)
+        else:
+            process = subprocess.Popen(
+                args,
+                cwd=str(project_dir),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                shell=shell,
+            )
+            stdout, stderr = process.communicate()
+            exit_code = int(process.returncode)
+    except OSError as exc:
+        spawn_error = str(exc)
+        stderr = spawn_error
+
+    wall_seconds = time.perf_counter() - start
+
+    if psutil is None or process is None:
         cpu_seconds = None
+    elif monitored_cpu_seconds is None:
+        # psutil path should always set this; fallback to numeric zero if monitoring failed unexpectedly.
+        cpu_seconds = 0.0
     else:
-        try:
-            cpu_times = process.cpu_times()
-            cpu_seconds = float(cpu_times.user + cpu_times.system)
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            cpu_seconds = None
+        cpu_seconds = float(monitored_cpu_seconds)
 
     energy_proxy_joules = None
     if cpu_seconds is not None:
         energy_proxy_joules = cpu_seconds * cpu_watt_assumption
 
+    artifact_metrics = _build_artifact_metrics(project_dir=project_dir, ssg=ssg, artifact_dir=artifact_dir)
+    notes: list[str] = []
+    if psutil is None:
+        notes.append("psutil not installed: cpu_seconds unavailable, energy proxy omitted.")
+    if spawn_error is not None:
+        notes.append("Build command failed to start. Check that the tool is installed and on PATH.")
+    if artifact_metrics.get("exists") is not True:
+        notes.append("Build artifact directory not found after build.")
+    if cpu_seconds is not None and cpu_seconds < 0.001:
+        warnings.append("CPU time below 0.001s: build likely too fast for reliable energy estimation.")
+
     return {
         "metric_type": "build",
         "started_at_utc": started_at,
         "finished_at_utc": now_iso(),
+        "ssg": ssg,
+        "build_pid": int(process.pid) if process is not None else None,
+        "observed_process_tree_pids": monitored_pids if psutil is not None else [],
         "command": command,
         "project_dir": str(project_dir),
         "exit_code": exit_code,
@@ -80,14 +125,128 @@ def run_build_measurement(
             "assumed_cpu_watts": cpu_watt_assumption,
             "joules": energy_proxy_joules,
         },
-        "notes": (
-            []
-            if psutil is not None
-            else ["psutil not installed: cpu_seconds unavailable, energy proxy omitted."]
-        ),
+        "build_artifact": artifact_metrics,
+        "warnings": warnings,
+        "notes": notes,
         "stdout_tail": _tail(stdout),
         "stderr_tail": _tail(stderr),
     }
+
+
+def _monitor_cpu_seconds(process: Any, poll_interval_sec: float = 0.02) -> tuple[float, list[int]]:
+    """Track CPU time for process tree (parent + observed children) across process lifetime."""
+    if psutil is None:
+        return 0.0, []
+
+    tracked: dict[int, float] = {}
+    root_pid = process.pid
+
+    while process.poll() is None:
+        _sample_process_tree_cpu(root_pid, tracked)
+        time.sleep(poll_interval_sec)
+
+    # Final sample to catch end-of-life CPU usage.
+    _sample_process_tree_cpu(root_pid, tracked)
+    return float(sum(tracked.values())), sorted(tracked.keys())
+
+
+def _sample_process_tree_cpu(root_pid: int, tracked: dict[int, float]) -> None:
+    if psutil is None:
+        return
+    try:
+        root = psutil.Process(root_pid)
+        _sample_one_process_cpu(root, tracked)
+        for child in root.children(recursive=True):
+            _sample_one_process_cpu(child, tracked)
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return
+
+
+def _sample_one_process_cpu(proc: Any, tracked: dict[int, float]) -> None:
+    if psutil is None:
+        return
+    try:
+        times = proc.cpu_times()
+        value = float(times.user + times.system)
+        pid = int(proc.pid)
+        tracked[pid] = max(tracked.get(pid, 0.0), value)
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        return
+
+
+def _placeholder_command_warnings(command: str) -> list[str]:
+    cmd_lower = command.strip().lower()
+    parts = shlex.split(cmd_lower, posix=False) if cmd_lower else []
+    warnings: list[str] = []
+
+    if not parts:
+        return ["Build command is empty."]
+
+    first_token = parts[0]
+    if first_token in PLACEHOLDER_TOKEN_MARKERS:
+        warnings.append("Build command appears to be a placeholder (echo/printf/write-*).")
+    if "cmd" in parts and "/c" in parts and "echo" in parts:
+        warnings.append("Build command uses `cmd /c echo`, likely a placeholder.")
+    if "build-ok" in cmd_lower or "placeholder" in cmd_lower:
+        warnings.append("Build command contains marker text often used for placeholder runs.")
+
+    return warnings
+
+
+def _build_artifact_metrics(
+    project_dir: Path,
+    ssg: str | None = None,
+    artifact_dir: Path | None = None,
+) -> dict[str, Any]:
+    resolved = _resolve_artifact_dir(project_dir=project_dir, ssg=ssg, artifact_dir=artifact_dir)
+    if resolved is None:
+        return {
+            "path": None,
+            "exists": False,
+            "size_bytes": None,
+            "file_count": 0,
+        }
+
+    if not resolved.exists() or not resolved.is_dir():
+        return {
+            "path": str(resolved),
+            "exists": False,
+            "size_bytes": None,
+            "file_count": 0,
+        }
+
+    total_size = 0
+    file_count = 0
+    for path in resolved.rglob("*"):
+        if path.is_file():
+            file_count += 1
+            total_size += path.stat().st_size
+
+    return {
+        "path": str(resolved),
+        "exists": True,
+        "size_bytes": total_size,
+        "file_count": file_count,
+    }
+
+
+def _resolve_artifact_dir(
+    project_dir: Path,
+    ssg: str | None = None,
+    artifact_dir: Path | None = None,
+) -> Path | None:
+    if artifact_dir is not None:
+        return artifact_dir if artifact_dir.is_absolute() else (project_dir / artifact_dir)
+
+    ssg_name = (ssg or "").lower()
+    if ssg_name in DEFAULT_BUILD_ARTIFACT_DIRS:
+        return project_dir / DEFAULT_BUILD_ARTIFACT_DIRS[ssg_name]
+
+    for candidate in ("public", "_site", "output", "dist", "build"):
+        candidate_path = project_dir / candidate
+        if candidate_path.exists() and candidate_path.is_dir():
+            return candidate_path
+    return None
 
 
 def _tail(value: str, max_chars: int = 2500) -> str:
@@ -212,15 +371,52 @@ def measure_runtime_url(url: str, runs: int = 5, timeout_sec: float = 10.0) -> d
 
 
 def measure_runtime_comparison(
-    static_url: str,
+    static_url: str | None,
     dynamic_url: str | None,
+    static_dir: Path | None = None,
+    dynamic_local: bool = False,
+    local_host: str = "127.0.0.1",
     runs: int = 5,
     timeout_sec: float = 10.0,
 ) -> dict[str, Any]:
-    static_metrics = measure_runtime_url(static_url, runs=runs, timeout_sec=timeout_sec)
-    dynamic_metrics = (
-        measure_runtime_url(dynamic_url, runs=runs, timeout_sec=timeout_sec) if dynamic_url else None
-    )
+    if static_url is None and static_dir is None:
+        raise ValueError("Provide either static_url or static_dir.")
+    if dynamic_local and static_dir is None:
+        raise ValueError("dynamic_local requires static_dir.")
+
+    static_server: dict[str, Any] | None = None
+    dynamic_server: dict[str, Any] | None = None
+    notes: list[str] = []
+
+    try:
+        if static_dir is not None:
+            static_server = _start_local_static_server(static_dir, host=local_host)
+            static_target = static_server["url"]
+            notes.append(f"Started local static server at {static_target}")
+        else:
+            static_target = str(static_url)
+
+        if dynamic_local:
+            html_payload = _load_static_html_payload(static_dir)
+            dynamic_server = _start_local_dynamic_server(html_payload, host=local_host)
+            dynamic_target = dynamic_server["url"]
+            notes.append(f"Started local dynamic server at {dynamic_target}")
+        else:
+            dynamic_target = dynamic_url
+
+        static_metrics = measure_runtime_url(static_target, runs=runs, timeout_sec=timeout_sec)
+        dynamic_metrics = (
+            measure_runtime_url(dynamic_target, runs=runs, timeout_sec=timeout_sec)
+            if dynamic_target
+            else None
+        )
+    finally:
+        if dynamic_server is not None:
+            _stop_local_server(dynamic_server)
+            notes.append("Stopped local dynamic server.")
+        if static_server is not None:
+            _stop_local_server(static_server)
+            notes.append("Stopped local static server.")
 
     comparison = None
     if dynamic_metrics:
@@ -229,6 +425,8 @@ def measure_runtime_comparison(
         s_transfer = static_metrics["summary"]["avg_transfer_bytes"]
         d_transfer = dynamic_metrics["summary"]["avg_transfer_bytes"]
         comparison = {
+            "latency_ratio": _safe_ratio(d_lat, s_lat),
+            "transfer_ratio": _safe_ratio(d_transfer, s_transfer),
             "latency_ratio_dynamic_over_static": _safe_ratio(d_lat, s_lat),
             "transfer_ratio_dynamic_over_static": _safe_ratio(d_transfer, s_transfer),
         }
@@ -236,10 +434,114 @@ def measure_runtime_comparison(
     return {
         "metric_type": "runtime",
         "measured_at_utc": now_iso(),
+        "mode": {
+            "static_source": "local_dir" if static_dir is not None else "url",
+            "dynamic_source": "local_dynamic_server" if dynamic_local else ("url" if dynamic_url else None),
+        },
+        "servers": {
+            "static_local": _server_summary(static_server),
+            "dynamic_local": _server_summary(dynamic_server),
+        },
         "static": static_metrics,
         "dynamic": dynamic_metrics,
         "comparison": comparison,
+        "notes": notes,
     }
+
+
+class _SilentStaticHandler(SimpleHTTPRequestHandler):
+    def log_message(self, format: str, *args: Any) -> None:  # noqa: A003
+        return
+
+
+def _make_dynamic_handler(payload: bytes) -> type[BaseHTTPRequestHandler]:
+    class _DynamicHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            # Minimal dynamic rendering path; same baseline HTML payload on each request.
+            body = payload
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format: str, *args: Any) -> None:  # noqa: A003
+            return
+
+    return _DynamicHandler
+
+
+def _start_local_static_server(directory: Path, host: str = "127.0.0.1") -> dict[str, Any]:
+    if not directory.exists() or not directory.is_dir():
+        raise FileNotFoundError(f"Static directory does not exist: {directory}")
+
+    handler_cls = functools.partial(_SilentStaticHandler, directory=str(directory))
+    return _start_local_server(handler_cls, host=host, server_type="static", root=directory)
+
+
+def _start_local_dynamic_server(payload: bytes, host: str = "127.0.0.1") -> dict[str, Any]:
+    handler_cls = _make_dynamic_handler(payload)
+    return _start_local_server(handler_cls, host=host, server_type="dynamic", root=None)
+
+
+def _start_local_server(
+    handler_cls: type[BaseHTTPRequestHandler] | Any,
+    host: str,
+    server_type: str,
+    root: Path | None,
+) -> dict[str, Any]:
+    httpd = ThreadingHTTPServer((host, 0), handler_cls)
+    port = int(httpd.server_port)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    return {
+        "type": server_type,
+        "host": host,
+        "port": port,
+        "url": f"http://{host}:{port}/",
+        "root": str(root) if root else None,
+        "httpd": httpd,
+        "thread": thread,
+    }
+
+
+def _stop_local_server(server: dict[str, Any]) -> None:
+    httpd = server.get("httpd")
+    thread = server.get("thread")
+    if httpd is not None:
+        httpd.shutdown()
+        httpd.server_close()
+    if thread is not None and isinstance(thread, threading.Thread):
+        thread.join(timeout=2.0)
+
+
+def _server_summary(server: dict[str, Any] | None) -> dict[str, Any] | None:
+    if server is None:
+        return None
+    return {
+        "type": server.get("type"),
+        "host": server.get("host"),
+        "port": server.get("port"),
+        "url": server.get("url"),
+        "root": server.get("root"),
+    }
+
+
+def _load_static_html_payload(static_dir: Path | None) -> bytes:
+    if static_dir is None:
+        return b"<html><body><h1>Dynamic baseline</h1></body></html>"
+
+    candidates = [static_dir / "index.html"]
+    candidates.extend(static_dir.rglob("index.html"))
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_file():
+            return candidate.read_bytes()
+
+    html_files = list(static_dir.rglob("*.html"))
+    if html_files:
+        return html_files[0].read_bytes()
+
+    return b"<html><body><h1>Dynamic baseline</h1></body></html>"
 
 
 def _safe_mean(values: list[float | int]) -> float | None:
