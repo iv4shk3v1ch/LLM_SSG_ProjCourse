@@ -1,6 +1,6 @@
 # LLM-Assisted SSG Case-Study Prototype
 
-Prototype CLI for a CS Project Course case study on energy-aware static site generation.
+Prototype CLI for a case study on energy-aware static site generation.
 
 ## Scope
 - Generates SSG scaffolds from a site spec.
@@ -101,6 +101,19 @@ Get-Content reports/portfolio_report.md
 Get-Content reports/portfolio_report.json
 ```
 
+9. Compare SSG candidates (scaffold + repeated builds + ranking):
+```powershell
+python -m ssg_case_tool.cli compare-ssg --spec scenarios/portfolio_migration.json --runs 5 --out reports/ssg_compare.json --out-root demos/compare --force
+```
+`compare-ssg` enforces clean builds: it removes the expected artifact directory before each run, verifies deletion, and marks runs invalid if the artifact is missing or unchanged after build.
+For Eleventy in `compare-ssg`, the tool runs in the Eleventy scaffold directory, executes `npm install` when `node_modules` is missing, uses `npm run build`, captures full stdout/stderr, and records stderr in JSON when build/setup fails.
+Ranking uses median energy proxy (`joules`) as primary and artifact size as secondary; CPU seconds are retained for reference only.
+
+To scale workload, use synthetic page expansion:
+```powershell
+python -m ssg_case_tool.cli compare-ssg --spec scenarios/portfolio_migration.json --page-multiplier 10 --runs 5 --out reports/ssg_compare.json --out-root demos/compare --force
+```
+
 ## Quick command examples
 ```powershell
 python -m ssg_case_tool.cli scaffold --spec scenarios/portfolio_migration.json --out demos/portfolio_hugo --ssg hugo
@@ -119,6 +132,8 @@ python -m ssg_case_tool.cli report --spec scenarios/portfolio_migration.json --b
 - `report`: merge all artifacts into machine/human-readable summaries.
 
 ## Notes
-- Build energy uses a clearly labeled proxy: `CPU time (s) * assumed CPU watts`.
+- Build energy uses a clearly labeled proxy: `energy_seconds * assumed_system_watts`.
+- If `cpu_seconds` is `0` or unavailable, `energy_basis` switches to `wall_time_seconds`.
 - Runtime comparison is network-level proxy (latency + transfer bytes), not full RAPL hardware power telemetry.
 - For Windows/macOS/Linux energy telemetry, extend `instrumentation.py` with platform tools.
+- Zola scaffolds automatically run `zola check` after generation and fail early if invalid.

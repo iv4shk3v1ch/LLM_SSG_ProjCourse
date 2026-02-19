@@ -37,10 +37,11 @@ PLACEHOLDER_TOKEN_MARKERS = {
 def run_build_measurement(
     command: str,
     project_dir: Path,
-    cpu_watt_assumption: float = 35.0,
+    cpu_watt_assumption: float = 65.0,
     shell: bool = False,
     ssg: str | None = None,
     artifact_dir: Path | None = None,
+    capture_full_output: bool = False,
 ) -> dict[str, Any]:
     started_at = now_iso()
     start = time.perf_counter()
@@ -54,6 +55,7 @@ def run_build_measurement(
     spawn_error: str | None = None
     monitored_cpu_seconds: float | None = None
     monitored_pids: list[int] = []
+    cpu_tree_breakdown: dict[str, Any] | None = None
 
     try:
         if psutil is not None:
@@ -65,9 +67,11 @@ def run_build_measurement(
                 text=True,
                 shell=shell,
             )
-            monitored_cpu_seconds, monitored_pids = _monitor_cpu_seconds(process)
             stdout, stderr = process.communicate()
             exit_code = int(process.returncode)
+            monitored_cpu_seconds, monitored_pids, cpu_tree_breakdown = _collect_cpu_seconds_after_completion(
+                process
+            )
         else:
             process = subprocess.Popen(
                 args,
@@ -93,37 +97,47 @@ def run_build_measurement(
     else:
         cpu_seconds = float(monitored_cpu_seconds)
 
-    energy_proxy_joules = None
-    if cpu_seconds is not None:
-        energy_proxy_joules = cpu_seconds * cpu_watt_assumption
+    energy_basis = "cpu_time_seconds"
+    energy_seconds = cpu_seconds
+    if energy_seconds is None or energy_seconds == 0:
+        energy_basis = "wall_time_seconds"
+        energy_seconds = wall_seconds
+    energy_proxy_joules = float(energy_seconds) * float(cpu_watt_assumption)
 
     artifact_metrics = _build_artifact_metrics(project_dir=project_dir, ssg=ssg, artifact_dir=artifact_dir)
     notes: list[str] = []
     if psutil is None:
-        notes.append("psutil not installed: cpu_seconds unavailable, energy proxy omitted.")
+        notes.append("psutil not installed: cpu_seconds unavailable; energy proxy uses wall time.")
     if spawn_error is not None:
         notes.append("Build command failed to start. Check that the tool is installed and on PATH.")
     if artifact_metrics.get("exists") is not True:
         notes.append("Build artifact directory not found after build.")
+    if cpu_seconds in {None, 0.0}:
+        notes.append("Energy proxy basis switched to wall_time_seconds because cpu_seconds was zero/unavailable.")
     if cpu_seconds is not None and cpu_seconds < 0.001:
         warnings.append("CPU time below 0.001s: build likely too fast for reliable energy estimation.")
 
-    return {
+    result = {
         "metric_type": "build",
         "started_at_utc": started_at,
         "finished_at_utc": now_iso(),
         "ssg": ssg,
         "build_pid": int(process.pid) if process is not None else None,
         "observed_process_tree_pids": monitored_pids if psutil is not None else [],
+        "process_tree_cpu": cpu_tree_breakdown if cpu_tree_breakdown is not None else None,
         "command": command,
         "project_dir": str(project_dir),
         "exit_code": exit_code,
         "wall_seconds": wall_seconds,
         "cpu_seconds": cpu_seconds,
+        "cpu_seconds_display": _format_small_float(cpu_seconds),
         "energy_proxy": {
-            "label": "cpu_time_seconds_x_assumed_cpu_watts",
-            "assumed_cpu_watts": cpu_watt_assumption,
+            "label": "energy_seconds_x_assumed_system_watts",
+            "energy_basis": energy_basis,
+            "energy_seconds": energy_seconds,
+            "assumed_system_watts": cpu_watt_assumption,
             "joules": energy_proxy_joules,
+            "joules_display": _format_small_float(energy_proxy_joules),
         },
         "build_artifact": artifact_metrics,
         "warnings": warnings,
@@ -131,47 +145,75 @@ def run_build_measurement(
         "stdout_tail": _tail(stdout),
         "stderr_tail": _tail(stderr),
     }
+    if capture_full_output:
+        result["stdout_full"] = stdout
+        result["stderr_full"] = stderr
+    return result
 
 
-def _monitor_cpu_seconds(process: Any, poll_interval_sec: float = 0.02) -> tuple[float, list[int]]:
-    """Track CPU time for process tree (parent + observed children) across process lifetime."""
+def _collect_cpu_seconds_after_completion(
+    process: Any,
+) -> tuple[float, list[int], dict[str, Any]]:
+    """Collect process-tree CPU after the build subprocess has completed."""
     if psutil is None:
-        return 0.0, []
+        return 0.0, [], {}
 
-    tracked: dict[int, float] = {}
-    root_pid = process.pid
+    root_pid = int(getattr(process, "pid", -1))
+    root_cpu = 0.0
+    child_cpu = 0.0
+    pids: list[int] = []
 
-    while process.poll() is None:
-        _sample_process_tree_cpu(root_pid, tracked)
-        time.sleep(poll_interval_sec)
+    if root_pid > 0:
+        pids.append(root_pid)
 
-    # Final sample to catch end-of-life CPU usage.
-    _sample_process_tree_cpu(root_pid, tracked)
-    return float(sum(tracked.values())), sorted(tracked.keys())
-
-
-def _sample_process_tree_cpu(root_pid: int, tracked: dict[int, float]) -> None:
-    if psutil is None:
-        return
     try:
-        root = psutil.Process(root_pid)
-        _sample_one_process_cpu(root, tracked)
-        for child in root.children(recursive=True):
-            _sample_one_process_cpu(child, tracked)
-    except (psutil.NoSuchProcess, psutil.AccessDenied):
-        return
+        root_times = process.cpu_times()
+        root_cpu = float(root_times.user + root_times.system)
+    except (psutil.NoSuchProcess, psutil.AccessDenied, AttributeError):
+        root_cpu = 0.0
 
-
-def _sample_one_process_cpu(proc: Any, tracked: dict[int, float]) -> None:
-    if psutil is None:
-        return
+    children: list[Any] = []
     try:
-        times = proc.cpu_times()
-        value = float(times.user + times.system)
-        pid = int(proc.pid)
-        tracked[pid] = max(tracked.get(pid, 0.0), value)
-    except (psutil.NoSuchProcess, psutil.AccessDenied):
-        return
+        children = process.children(recursive=True)
+    except (psutil.NoSuchProcess, psutil.AccessDenied, AttributeError):
+        children = []
+
+    seen = {root_pid} if root_pid > 0 else set()
+    for child in children:
+        try:
+            child_pid = int(child.pid)
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if child_pid in seen:
+            continue
+        seen.add(child_pid)
+        pids.append(child_pid)
+        try:
+            child_times = child.cpu_times()
+            child_cpu += float(child_times.user + child_times.system)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, AttributeError):
+            continue
+
+    total_cpu = root_cpu + child_cpu
+    breakdown = {
+        "root_pid": int(root_pid),
+        "root_cpu_seconds": root_cpu,
+        "children_cpu_seconds": child_cpu,
+        "total_cpu_seconds": total_cpu,
+        "tracked_pid_count": len(set(pids)),
+        "collection_mode": "post_completion_cpu_times",
+    }
+    return total_cpu, sorted(set(pids)), breakdown
+
+
+def _format_small_float(value: float | None) -> str | None:
+    if value is None:
+        return None
+    if value == 0:
+        return "0.00000000"
+    if abs(value) < 0.0005:
+        return f"{value:.12f}".rstrip("0").rstrip(".")
+    return f"{value:.8f}"
 
 
 def _placeholder_command_warnings(command: str) -> list[str]:

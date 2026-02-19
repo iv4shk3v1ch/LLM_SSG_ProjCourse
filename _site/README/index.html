@@ -1,0 +1,118 @@
+<h1>LLM-Assisted SSG Case-Study Prototype</h1>
+<p>Prototype CLI for a CS Project Course case study on energy-aware static site generation.</p>
+<h2>Scope</h2>
+<ul>
+<li>Generates SSG scaffolds from a site spec.</li>
+<li>Excludes AI content generation (uses placeholders only).</li>
+<li>Records build/runtime/LLM-usage metrics.</li>
+<li>Produces JSON + Markdown reports.</li>
+</ul>
+<h2>Supported SSGs</h2>
+<ul>
+<li>Eleventy</li>
+<li>Hugo</li>
+<li>Zola</li>
+<li>Pelican</li>
+</ul>
+<h2>Prerequisites</h2>
+<ul>
+<li>Windows PowerShell</li>
+<li>Python 3.10+</li>
+</ul>
+<h2>Option A: Run Without Installing (recommended for audit)</h2>
+<pre><code class="language-powershell">cd C:\Users\ivash\LLM_SSG_ProjCourse
+python -m ssg_case_tool.cli -h
+</code></pre>
+<h2>Option B: Editable Install</h2>
+<pre><code class="language-powershell">python -m pip install -e .
+ssg-case -h
+</code></pre>
+<p>If <code>pip install -e .</code> fails with temp/permission errors on Windows, use Option A above and run via <code>python -m ssg_case_tool.cli ...</code>.</p>
+<h2>Step-by-Step Audit (PowerShell)</h2>
+<ol>
+<li>Check CLI entrypoint:</li>
+</ol>
+<pre><code class="language-powershell">python -m ssg_case_tool.cli -h
+</code></pre>
+<ol start="2">
+<li>Generate a scaffold (portfolio scenario):</li>
+</ol>
+<pre><code class="language-powershell">python -m ssg_case_tool.cli scaffold --spec scenarios/portfolio_migration.json --out demos/portfolio_hugo --ssg hugo --manifest reports/portfolio_scaffold.json --force
+</code></pre>
+<ol start="3">
+<li>Confirm generated project files:</li>
+</ol>
+<pre><code class="language-powershell">Get-ChildItem -Recurse demos/portfolio_hugo
+</code></pre>
+<ol start="4">
+<li>Log one LLM call proxy row:</li>
+</ol>
+<pre><code class="language-powershell">python -m ssg_case_tool.cli record-llm --log reports/llm_calls.jsonl --session portfolio --step scaffold --model gpt-4.1 --prompt-tokens 1200 --completion-tokens 300
+</code></pre>
+<ol start="5">
+<li>Measure a build command:</li>
+</ol>
+<pre><code class="language-powershell">python -m ssg_case_tool.cli measure-build --project demos/portfolio_hugo --ssg hugo --out reports/portfolio_build.json
+</code></pre>
+<p>Defaults per SSG:</p>
+<ul>
+<li><code>hugo</code>: <code>hugo --minify</code></li>
+<li><code>eleventy</code>: <code>npx @11ty/eleventy</code></li>
+<li><code>zola</code>: <code>zola build</code></li>
+<li><code>pelican</code>: <code>pelican content -o output -s pelicanconf.py</code></li>
+</ul>
+<p>These commands require the corresponding tool to be installed and available on <code>PATH</code>.</p>
+<p>Override default command:</p>
+<pre><code class="language-powershell">python -m ssg_case_tool.cli measure-build --project demos/portfolio_hugo --build-command &quot;hugo --minify --gc&quot; --out reports/portfolio_build.json
+</code></pre>
+<p>If you pass a placeholder command like <code>echo</code>, the tool records warnings in JSON and prints them in CLI output.</p>
+<ol start="6">
+<li>Measure runtime proxy (example endpoint):</li>
+</ol>
+<pre><code class="language-powershell">python -m ssg_case_tool.cli measure-runtime --static-url https://example.com --runs 3 --out reports/portfolio_runtime.json
+</code></pre>
+<p>Local runtime measurement from build artifact directory:</p>
+<pre><code class="language-powershell">python -m ssg_case_tool.cli measure-runtime --static-dir demos/portfolio_hugo/public --runs 5 --out reports/portfolio_runtime.json
+</code></pre>
+<p>Local static vs local dynamic comparison (same HTML payload):</p>
+<pre><code class="language-powershell">python -m ssg_case_tool.cli measure-runtime --static-dir demos/portfolio_hugo/public --dynamic-local --runs 5 --out reports/portfolio_runtime_compare.json
+</code></pre>
+<p>The command starts temporary local servers on random free ports, runs latency/TTFB/transfer tests, and shuts servers down automatically.</p>
+<ol start="7">
+<li>Generate combined report:</li>
+</ol>
+<pre><code class="language-powershell">python -m ssg_case_tool.cli report --spec scenarios/portfolio_migration.json --scaffold reports/portfolio_scaffold.json --build reports/portfolio_build.json --runtime reports/portfolio_runtime.json --llm-log reports/llm_calls.jsonl --session portfolio --out-json reports/portfolio_report.json --out-md reports/portfolio_report.md
+</code></pre>
+<ol start="8">
+<li>Review report outputs:</li>
+</ol>
+<pre><code class="language-powershell">Get-Content reports/portfolio_report.md
+Get-Content reports/portfolio_report.json
+</code></pre>
+<ol start="9">
+<li>Compare SSG candidates (scaffold + repeated builds + ranking):</li>
+</ol>
+<pre><code class="language-powershell">python -m ssg_case_tool.cli compare-ssg --spec scenarios/portfolio_migration.json --runs 5 --out reports/ssg_compare.json --out-root demos/compare --force
+</code></pre>
+<h2>Quick command examples</h2>
+<pre><code class="language-powershell">python -m ssg_case_tool.cli scaffold --spec scenarios/portfolio_migration.json --out demos/portfolio_hugo --ssg hugo
+python -m ssg_case_tool.cli record-llm --log reports/llm_calls.jsonl --session portfolio --step scaffold --model gpt-4.1 --prompt-tokens 1200 --completion-tokens 300
+python -m ssg_case_tool.cli measure-build --project demos/portfolio_hugo --ssg hugo --out reports/portfolio_build.json
+python -m ssg_case_tool.cli measure-runtime --static-url https://example-static.site --dynamic-url https://example-dynamic.site --runs 5 --out reports/portfolio_runtime.json
+python -m ssg_case_tool.cli measure-runtime --static-dir demos/portfolio_hugo/public --dynamic-local --runs 5 --out reports/portfolio_runtime_local.json
+python -m ssg_case_tool.cli report --spec scenarios/portfolio_migration.json --build reports/portfolio_build.json --runtime reports/portfolio_runtime.json --llm-log reports/llm_calls.jsonl --session portfolio --out-json reports/portfolio_report.json --out-md reports/portfolio_report.md
+</code></pre>
+<h2>CLI overview</h2>
+<ul>
+<li><code>scaffold</code>: generate SSG project structure/config/templates/placeholders.</li>
+<li><code>measure-build</code>: run build command and log wall time, CPU time, energy proxy.</li>
+<li><code>record-llm</code>: append one LLM call record (tokens/call count proxy).</li>
+<li><code>measure-runtime</code>: compare static vs dynamic runtime transfer/latency proxies.</li>
+<li><code>report</code>: merge all artifacts into machine/human-readable summaries.</li>
+</ul>
+<h2>Notes</h2>
+<ul>
+<li>Build energy uses a clearly labeled proxy: <code>CPU time (s) * assumed CPU watts</code>.</li>
+<li>Runtime comparison is network-level proxy (latency + transfer bytes), not full RAPL hardware power telemetry.</li>
+<li>For Windows/macOS/Linux energy telemetry, extend <code>instrumentation.py</code> with platform tools.</li>
+</ul>

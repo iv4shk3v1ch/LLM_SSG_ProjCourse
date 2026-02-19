@@ -1,0 +1,56 @@
+<h1>Initial SSG Comparison Matrix</h1>
+<p>Purpose: choose one final generator after pilot measurements and pragmatic constraints.</p>
+<h2>Criteria</h2>
+<ul>
+<li>Build speed (measured wall + CPU time)</li>
+<li>Setup complexity for newcomers from dynamic/WYSIWYG workflows</li>
+<li>Template flexibility for layout/nav/frontmatter automation</li>
+<li>Documentation maturity and maintenance</li>
+<li>Deployment fit for static hosting targets</li>
+</ul>
+<h2>Candidate snapshot</h2>
+<table>
+<thead>
+<tr>
+<th>SSG</th>
+<th>Strengths</th>
+<th>Risks</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Hugo</td>
+<td>Very fast builds, single binary, strong templates</td>
+<td>Go template syntax learning curve</td>
+</tr>
+<tr>
+<td>Eleventy</td>
+<td>JS ecosystem, flexible data/layout model</td>
+<td>Node/npm toolchain overhead</td>
+</tr>
+<tr>
+<td>Zola</td>
+<td>Good defaults, single binary, clean setup</td>
+<td>Smaller ecosystem than Hugo/Eleventy</td>
+</tr>
+<tr>
+<td>Pelican</td>
+<td>Python ecosystem familiarity</td>
+<td>Lower momentum in some workflows</td>
+</tr>
+</tbody>
+</table>
+<h2>Recommended initial baseline</h2>
+<p>Use Hugo as baseline for final prototype unless pilot measurements in your environment strongly contradict:</p>
+<ul>
+<li>usually lowest build-time overhead</li>
+<li>simple binary-based CI/deployment</li>
+<li>straightforward content/frontmatter model for migration wrappers</li>
+</ul>
+<h2>How to finalize decision</h2>
+<ol>
+<li>Generate same scenario spec across all 4 SSGs.</li>
+<li>Run <code>measure-build</code> 5x each and compare average + variance.</li>
+<li>Report qualitative setup friction (install/build/debug steps).</li>
+<li>Select one SSG with quantitative + qualitative justification.</li>
+</ol>

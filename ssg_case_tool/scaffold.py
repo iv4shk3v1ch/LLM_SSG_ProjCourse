@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -15,9 +16,16 @@ def _normalized_pages(spec: dict[str, Any]) -> list[dict[str, str]]:
         title = str(page.get("title", "Untitled"))
         slug = str(page.get("slug", "")).strip("/")
         placeholder = str(page.get("placeholder", f"{title} text goes here."))
-        normalized.append({"title": title, "slug": slug, "placeholder": placeholder})
+        normalized.append(
+            {
+                "title": title,
+                "slug": slug,
+                "placeholder": placeholder,
+                "is_section": (slug == ""),
+            }
+        )
     if not normalized:
-        normalized = [{"title": "Home", "slug": "", "placeholder": "Home text goes here."}]
+        normalized = [{"title": "Home", "slug": "", "placeholder": "Home text goes here.", "is_section": True}]
     return normalized
 
 
@@ -32,13 +40,60 @@ def _normalized_nav(spec: dict[str, Any], pages: list[dict[str, str]]) -> list[d
     return fallback
 
 
+def _title_slug(title: str) -> str:
+    return slug_to_path(title.lower().replace(" ", "-"))
+
+
+def _expand_pages(pages: list[dict[str, Any]], page_multiplier: int) -> list[dict[str, Any]]:
+    if page_multiplier <= 1:
+        return pages
+
+    expanded: list[dict[str, Any]] = []
+    used_slugs: set[str] = set()
+
+    def _unique_slug(candidate: str, title: str) -> str:
+        if candidate not in used_slugs:
+            return candidate
+        base = candidate if candidate else _title_slug(title)
+        idx = 2
+        while True:
+            attempt = f"{base}-{idx}"
+            if attempt not in used_slugs:
+                return attempt
+            idx += 1
+
+    for page in pages:
+        base_slug = str(page.get("slug", "")).strip("/")
+        title = str(page.get("title", "Untitled"))
+        for i in range(1, page_multiplier + 1):
+            if i == 1:
+                candidate = base_slug
+            else:
+                if base_slug:
+                    candidate = f"{base_slug}-{i}"
+                else:
+                    candidate = f"{_title_slug(title)}-{i}"
+            final_slug = _unique_slug(candidate, title)
+            used_slugs.add(final_slug)
+
+            cloned = dict(page)
+            cloned["slug"] = final_slug
+            expanded.append(cloned)
+
+    return expanded
+
+
 def scaffold_project(
     spec: dict[str, Any],
     out_dir: Path,
     ssg: str,
     force: bool = False,
     spec_base_dir: Path | None = None,
+    page_multiplier: int = 1,
 ) -> dict[str, Any]:
+    if page_multiplier < 1:
+        raise ValueError("page_multiplier must be >= 1")
+
     ssg_name = ssg.lower()
     if ssg_name not in SUPPORTED_SSGS:
         raise ValueError(f"Unsupported SSG: {ssg_name}. Supported: {sorted(SUPPORTED_SSGS)}")
@@ -49,7 +104,7 @@ def scaffold_project(
     theme = str(site.get("theme", "baseline"))
     deployment_target = str(site.get("deployment_target", "static-host"))
 
-    pages = _normalized_pages(spec)
+    pages = _expand_pages(_normalized_pages(spec), page_multiplier)
     nav = _normalized_nav(spec, pages)
     ensure_dir(out_dir)
 
@@ -80,14 +135,29 @@ def scaffold_project(
     )
     written.extend(migration_artifacts)
 
-    return {
+    validation: dict[str, Any] | None = None
+    if ssg_name == "zola":
+        validation = _run_zola_check(out_dir)
+        if validation["exit_code"] != 0:
+            raise RuntimeError(
+                "Zola scaffold validation failed.\n"
+                f"stdout:\n{validation['stdout_tail']}\n"
+                f"stderr:\n{validation['stderr_tail']}"
+            )
+
+    result = {
         "ssg": ssg_name,
         "site_name": site_name,
         "base_url": base_url,
         "theme": theme,
         "deployment_target": deployment_target,
+        "page_multiplier": int(page_multiplier),
+        "generated_page_count": len(pages),
         "files_written": sorted(written),
     }
+    if validation is not None:
+        result["validation"] = validation
+    return result
 
 
 def _files_for_ssg(
@@ -145,8 +215,11 @@ def _eleventy_files(
             '  "name": "ssg-prototype-eleventy",\n'
             '  "private": true,\n'
             '  "scripts": {\n'
-            '    "build": "npx @11ty/eleventy",\n'
-            '    "serve": "npx @11ty/eleventy --serve"\n'
+            '    "build": "eleventy",\n'
+            '    "serve": "eleventy --serve"\n'
+            "  },\n"
+            '  "devDependencies": {\n'
+            '    "@11ty/eleventy": "^3.1.2"\n'
             "  }\n"
             "}\n"
         ),
@@ -204,15 +277,23 @@ def _eleventy_files(
 
 
 def _hugo_page(page: dict[str, str]) -> tuple[Path, str]:
-    slug = page["slug"]
-    file_name = "_index.md" if not slug else f"{slug_to_path(slug)}.md"
+    slug = str(page["slug"])
+    is_section = bool(page.get("is_section", False))
+    if is_section:
+        if not slug:
+            page_path = Path("content") / "_index.md"
+        else:
+            page_path = Path("content") / slug_to_path(slug) / "_index.md"
+    else:
+        file_name = "_index.md" if not slug else f"{slug_to_path(slug)}.md"
+        page_path = Path("content") / file_name
     body = (
         "+++\n"
         f'title = "{page["title"]}"\n'
         "+++\n\n"
         f'{page["placeholder"]}\n'
     )
-    return Path("content") / file_name, body
+    return page_path, body
 
 
 def _hugo_files(
@@ -273,16 +354,31 @@ def _hugo_files(
 
 
 def _zola_page(page: dict[str, str]) -> tuple[Path, str]:
-    slug = page["slug"]
-    file_name = "_index.md" if not slug else f"{slug_to_path(slug)}.md"
-    body = (
-        "+++\n"
-        f'title = "{page["title"]}"\n'
-        "template = \"page.html\"\n"
-        "+++\n\n"
-        f'{page["placeholder"]}\n'
-    )
-    return Path("content") / file_name, body
+    slug = str(page["slug"])
+    is_section = bool(page.get("is_section", False))
+    if is_section:
+        if not slug:
+            page_path = Path("content") / "_index.md"
+        else:
+            page_path = Path("content") / slug_to_path(slug) / "_index.md"
+        body = (
+            "+++\n"
+            f'title = "{page["title"]}"\n'
+            "template = \"index.html\"\n"
+            "+++\n\n"
+            f'{page["placeholder"]}\n'
+        )
+    else:
+        file_name = "_index.md" if not slug else f"{slug_to_path(slug)}.md"
+        page_path = Path("content") / file_name
+        body = (
+            "+++\n"
+            f'title = "{page["title"]}"\n'
+            "template = \"page.html\"\n"
+            "+++\n\n"
+            f'{page["placeholder"]}\n'
+        )
+    return page_path, body
 
 
 def _zola_files(
@@ -297,7 +393,10 @@ def _zola_files(
         Path("config.toml"): (
             f'base_url = "{base_url}"\n'
             f'title = "{site_name}"\n'
-            "build_search_index = false\n\n"
+            'default_language = "en"\n'
+            "build_search_index = false\n"
+            "compile_sass = false\n"
+            "generate_feeds = false\n\n"
             "[extra]\n"
             f'theme = "{theme}"\n'
             f'deployment_target = "{deployment_target}"\n'
@@ -344,6 +443,33 @@ def _zola_files(
         rel, body = _zola_page(page)
         files[rel] = body
     return files
+
+
+def _run_zola_check(project_dir: Path) -> dict[str, Any]:
+    try:
+        completed = subprocess.run(
+            ["zola", "check"],
+            cwd=str(project_dir),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except OSError as exc:
+        return {
+            "tool": "zola check",
+            "exit_code": 127,
+            "stdout_tail": "",
+            "stderr_tail": str(exc),
+            "notes": ["Failed to start `zola check`. Ensure zola is installed and on PATH."],
+        }
+
+    return {
+        "tool": "zola check",
+        "exit_code": int(completed.returncode),
+        "stdout_tail": completed.stdout[-2500:],
+        "stderr_tail": completed.stderr[-2500:],
+        "notes": [],
+    }
 
 
 def _pelican_page(page: dict[str, str]) -> tuple[Path, str]:
@@ -469,4 +595,3 @@ def _generate_migration_artifacts(
     written.append(str(linkage.relative_to(out_dir)))
 
     return written
-

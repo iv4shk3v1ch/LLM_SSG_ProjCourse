@@ -56,7 +56,9 @@ def render_markdown_summary(report: dict[str, Any]) -> str:
         f"- Exit code: {build.get('exit_code', 'N/A')}",
         f"- Wall time (s): {_fmt_num(build.get('wall_seconds'))}",
         f"- CPU time (s): {_fmt_num(build.get('cpu_seconds'))}",
-        f"- Energy proxy (J): {_fmt_num(energy_proxy.get('joules'))} (cpu_time_seconds_x_assumed_cpu_watts)",
+        f"- Energy proxy (J): {_fmt_num(energy_proxy.get('joules'))}",
+        f"- Energy basis: {energy_proxy.get('energy_basis', 'N/A')}",
+        f"- Assumed system watts: {_fmt_num(energy_proxy.get('assumed_system_watts'))}",
         f"- Build artifact path: {artifact.get('path', 'N/A')}",
         f"- Build artifact size (bytes): {_fmt_num(artifact.get('size_bytes'))}",
         f"- Build artifact file count: {_fmt_num(artifact.get('file_count'))}",
@@ -105,7 +107,13 @@ def _fmt_num(value: Any) -> str:
     if value is None:
         return "N/A"
     if isinstance(value, (int, float)):
-        return f"{value:.3f}" if isinstance(value, float) else str(value)
+        if isinstance(value, int):
+            return str(value)
+        if value == 0:
+            return "0.00000000"
+        if abs(value) < 0.0005:
+            return f"{value:.12f}".rstrip("0").rstrip(".")
+        return f"{value:.8f}"
     return str(value)
 
 
