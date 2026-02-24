@@ -1,0 +1,71 @@
+{
+  "prompt": "I need a simple academic portfolio site with Home, About, Projects, and Contact. Keep placeholders only and prepare it for static hosting.",
+  "spec": {
+    "site": {
+      "name": "Research Portfolio",
+      "type": "portfolio migration to static",
+      "theme": "clean academic",
+      "deployment_target": "GitHub Pages",
+      "base_url": "https://portfolio.example.com"
+    },
+    "ssg": {
+      "preferred": "hugo",
+      "candidates": [
+        "hugo",
+        "eleventy",
+        "zola",
+        "pelican"
+      ]
+    },
+    "nav": [
+      {
+        "label": "Home",
+        "url": "/"
+      },
+      {
+        "label": "About",
+        "url": "/about/"
+      },
+      {
+        "label": "Projects",
+        "url": "/projects/"
+      },
+      {
+        "label": "Contact",
+        "url": "/contact/"
+      }
+    ],
+    "pages": [
+      {
+        "title": "Home",
+        "slug": "",
+        "placeholder": "Home text goes here."
+      },
+      {
+        "title": "About",
+        "slug": "about",
+        "placeholder": "About text goes here."
+      },
+      {
+        "title": "Projects",
+        "slug": "projects",
+        "placeholder": "Projects text goes here."
+      },
+      {
+        "title": "Contact",
+        "slug": "contact",
+        "placeholder": "Contact text goes here."
+      }
+    ]
+  },
+  "llm_calls": [
+    {
+      "timestamp_utc": "2026-02-20T00:00:00+00:00",
+      "step": "spec_generation",
+      "model": "replay-gpt",
+      "prompt_tokens": 842,
+      "completion_tokens": 236,
+      "prompt_chars": 3792
+    }
+  ]
+}

@@ -1,0 +1,1 @@
+{"call_index": 0, "completion_tokens": 248, "metric_type": "llm_call", "mode": "replay", "model": "replay-gpt", "prompt_chars": 4088, "prompt_tokens": 910, "replay_fixture": "scenarios\\replay\\marketing_prompt_replay.json", "session": "marketing_m1", "step": "spec_generation", "timestamp_utc": "2026-02-20T00:00:00+00:00", "total_tokens": 1158}

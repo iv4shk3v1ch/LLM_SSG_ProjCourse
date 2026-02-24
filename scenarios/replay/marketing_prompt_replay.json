@@ -1,0 +1,80 @@
+{
+  "prompt": "Create a marketing landing site with Home, Features, Pricing, FAQ, and CTA. Keep placeholders only and prepare for static hosting.",
+  "spec": {
+    "site": {
+      "name": "Product Launch Landing",
+      "type": "marketing landing page",
+      "theme": "conversion-focused",
+      "deployment_target": "Cloudflare Pages",
+      "base_url": "https://launch.example.com"
+    },
+    "ssg": {
+      "preferred": "eleventy",
+      "candidates": [
+        "eleventy",
+        "hugo",
+        "zola",
+        "pelican"
+      ]
+    },
+    "nav": [
+      {
+        "label": "Home",
+        "url": "/"
+      },
+      {
+        "label": "Features",
+        "url": "/features/"
+      },
+      {
+        "label": "Pricing",
+        "url": "/pricing/"
+      },
+      {
+        "label": "FAQ",
+        "url": "/faq/"
+      },
+      {
+        "label": "CTA",
+        "url": "/cta/"
+      }
+    ],
+    "pages": [
+      {
+        "title": "Home",
+        "slug": "",
+        "placeholder": "Landing hero text goes here."
+      },
+      {
+        "title": "Features",
+        "slug": "features",
+        "placeholder": "Feature section text goes here."
+      },
+      {
+        "title": "Pricing",
+        "slug": "pricing",
+        "placeholder": "Pricing summary text goes here."
+      },
+      {
+        "title": "FAQ",
+        "slug": "faq",
+        "placeholder": "FAQ intro text goes here."
+      },
+      {
+        "title": "CTA",
+        "slug": "cta",
+        "placeholder": "Call-to-action text goes here."
+      }
+    ]
+  },
+  "llm_calls": [
+    {
+      "timestamp_utc": "2026-02-20T00:00:00+00:00",
+      "step": "spec_generation",
+      "model": "replay-gpt",
+      "prompt_tokens": 910,
+      "completion_tokens": 248,
+      "prompt_chars": 4088
+    }
+  ]
+}

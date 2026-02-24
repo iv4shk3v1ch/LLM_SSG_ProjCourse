@@ -317,10 +317,16 @@ def record_llm_call(
         "total_tokens": int(prompt_tokens) + int(completion_tokens),
         "prompt_chars": int(prompt_chars) if prompt_chars is not None else None,
     }
+    return record_llm_call_row(log_path=log_path, row=call)
+
+
+def record_llm_call_row(log_path: Path, row: dict[str, Any]) -> dict[str, Any]:
+    if "total_tokens" not in row:
+        row["total_tokens"] = int(row.get("prompt_tokens", 0)) + int(row.get("completion_tokens", 0))
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(call, ensure_ascii=True) + "\n")
-    return call
+        handle.write(json.dumps(row, ensure_ascii=True) + "\n")
+    return row
 
 
 def aggregate_llm_calls(log_path: Path, session: str | None = None) -> dict[str, Any]:

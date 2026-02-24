@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
 import shutil
 import statistics
@@ -17,7 +19,8 @@ from .instrumentation import (
 )
 from .reporting import combine_report, render_markdown_summary
 from .scaffold import SUPPORTED_SSGS, scaffold_project
-from .utils import dump_json, load_json, load_spec, now_iso
+from .spec_validation import validate_spec_schema
+from .utils import dump_json, load_json, load_spec, now_iso, slug_to_path
 
 DEFAULT_BUILD_COMMANDS: dict[str, str] = {
     "hugo": "hugo --minify",
@@ -50,6 +53,35 @@ def _build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=Path("reports/scaffold_manifest.json"),
         help="Where to write scaffold manifest JSON.",
+    )
+
+    p_spec = sub.add_parser(
+        "spec-from-prompt",
+        help="Generate a structured site spec from an informal prompt (replay mode supported).",
+    )
+    p_spec.add_argument("--prompt", help="Informal user prompt text.")
+    p_spec.add_argument("--prompt-file", type=Path, help="Path to a file containing informal prompt text.")
+    p_spec.add_argument(
+        "--mode",
+        choices=["replay", "live"],
+        default="replay",
+        help="LLM generation mode. `live` is reserved for future provider integration.",
+    )
+    p_spec.add_argument("--replay-fixture", type=Path, help="Replay fixture JSON path (required in replay mode).")
+    p_spec.add_argument("--session", required=True, help="Session id for telemetry.")
+    p_spec.add_argument("--step", default="spec_generation", help="Telemetry step label.")
+    p_spec.add_argument("--out-spec", required=True, type=Path, help="Output path for generated spec JSON.")
+    p_spec.add_argument(
+        "--out-telemetry",
+        required=True,
+        type=Path,
+        help="Output path for deterministic replay telemetry JSON.",
+    )
+    p_spec.add_argument(
+        "--llm-log",
+        type=Path,
+        default=Path("reports/llm_calls.jsonl"),
+        help="JSONL file to write call rows (overwritten for deterministic replay output).",
     )
 
     p_build = sub.add_parser("measure-build", help="Run build and record duration/cpu/energy proxy.")
@@ -132,11 +164,58 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_compare.add_argument("--force", action="store_true", help="Overwrite existing scaffold files.")
 
+    p_run = sub.add_parser(
+        "run-case",
+        help="Run single-SSG end-to-end flow: prompt->spec->scaffold->build->runtime->report.",
+    )
+    p_run.add_argument("--session", required=True, help="Session id used for all generated artifacts.")
+    p_run.add_argument("--prompt", help="Informal user prompt text.")
+    p_run.add_argument("--prompt-file", type=Path, help="Path to prompt text file.")
+    p_run.add_argument(
+        "--mode",
+        choices=["replay", "live"],
+        default="replay",
+        help="LLM generation mode. `live` is reserved for future provider integration.",
+    )
+    p_run.add_argument("--replay-fixture", type=Path, help="Replay fixture path (required in replay mode).")
+    p_run.add_argument("--ssg", choices=sorted(SUPPORTED_SSGS), help="Selected SSG. Defaults to spec preferred.")
+    p_run.add_argument(
+        "--out-root",
+        type=Path,
+        default=Path("demos/runs"),
+        help="Root folder for generated single-SSG project.",
+    )
+    p_run.add_argument(
+        "--reports-dir",
+        type=Path,
+        default=Path("reports"),
+        help="Directory for generated measurement/report artifacts.",
+    )
+    p_run.add_argument(
+        "--page-multiplier",
+        type=int,
+        default=1,
+        help="Generate N synthetic content files per base page.",
+    )
+    p_run.add_argument("--build-command", help="Optional build command override.")
+    p_run.add_argument("--artifact-dir", type=Path, help="Optional build artifact directory override.")
+    p_run.add_argument("--runtime-runs", type=int, default=5, help="Number of runtime request runs.")
+    p_run.add_argument("--timeout-sec", type=float, default=10.0, help="Runtime request timeout.")
+    p_run.add_argument(
+        "--system-watts",
+        type=float,
+        default=65.0,
+        help="Assumed system watts for energy proxy (used with cpu or wall-time basis).",
+    )
+    p_run.add_argument("--cpu-watts", dest="system_watts", type=float, help=argparse.SUPPRESS)
+    p_run.add_argument("--force", action="store_true", help="Overwrite scaffold files when they exist.")
+
     p_report = sub.add_parser("report", help="Assemble final JSON+Markdown report.")
     p_report.add_argument("--spec", type=Path, help="Spec path.")
     p_report.add_argument("--scaffold", type=Path, help="Scaffold manifest JSON.")
     p_report.add_argument("--build", type=Path, help="Build measurement JSON.")
     p_report.add_argument("--runtime", type=Path, help="Runtime measurement JSON.")
+    p_report.add_argument("--compare", type=Path, help="Optional multi-SSG comparison JSON.")
     p_report.add_argument("--llm-log", type=Path, help="LLM JSONL log.")
     p_report.add_argument("--session", help="Session id filter for llm log.")
     p_report.add_argument("--out-json", required=True, type=Path, help="Combined report JSON output path.")
@@ -321,14 +400,318 @@ def _fmt_md_num(value: Any) -> str:
     return str(value)
 
 
+def _load_prompt_text(prompt: str | None, prompt_file: Path | None) -> str:
+    if prompt is not None and prompt_file is not None:
+        raise SystemExit("Pass either --prompt or --prompt-file, not both.")
+    if prompt_file is not None:
+        return prompt_file.read_text(encoding="utf-8").strip()
+    if prompt is not None:
+        return str(prompt).strip()
+    return ""
+
+
+def _canonical_json_bytes(data: Any) -> bytes:
+    return json.dumps(data, ensure_ascii=True, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def _sha256_json(data: Any) -> str:
+    return hashlib.sha256(_canonical_json_bytes(data)).hexdigest()
+
+
+def _overwrite_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        for row in rows:
+            handle.write(json.dumps(row, ensure_ascii=True, sort_keys=True) + "\n")
+
+
+def _load_replay_fixture(path: Path) -> dict[str, Any]:
+    fixture = load_json(path)
+    if not isinstance(fixture.get("spec"), dict):
+        raise SystemExit("Replay fixture is missing object field: spec")
+    if not isinstance(fixture.get("llm_calls"), list) or not fixture["llm_calls"]:
+        raise SystemExit("Replay fixture must include non-empty array field: llm_calls")
+    return fixture
+
+
+def _build_replay_calls(
+    fixture_calls: list[dict[str, Any]],
+    session: str,
+    step: str,
+    replay_fixture: Path,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    replay_fixture_str = str(replay_fixture)
+    for idx, raw in enumerate(fixture_calls):
+        prompt_tokens = int(raw.get("prompt_tokens", 0))
+        completion_tokens = int(raw.get("completion_tokens", 0))
+        row = {
+            "metric_type": "llm_call",
+            "timestamp_utc": str(raw.get("timestamp_utc", "1970-01-01T00:00:00+00:00")),
+            "session": session,
+            "step": str(raw.get("step", step)),
+            "model": str(raw.get("model", "replay-model")),
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+            "prompt_chars": int(raw["prompt_chars"]) if raw.get("prompt_chars") is not None else None,
+            "mode": "replay",
+            "replay_fixture": replay_fixture_str,
+            "call_index": idx,
+        }
+        rows.append(row)
+    return rows
+
+
+def _validate_spec_or_exit(spec: dict[str, Any]) -> dict[str, Any]:
+    validation = validate_spec_schema(spec=spec, supported_ssgs=SUPPORTED_SSGS)
+    if validation.get("schema_validation_pass") is True:
+        return validation
+
+    lines = ["Spec validation failed:"]
+    for err in validation.get("errors", []):
+        lines.append(f"- [{err.get('code')}] {err.get('path')}: {err.get('message')}")
+    raise SystemExit("\n".join(lines))
+
+
+def _generate_spec_from_replay(
+    prompt_text: str,
+    replay_fixture: Path,
+    session: str,
+    step: str,
+    llm_log_path: Path,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    fixture = _load_replay_fixture(replay_fixture)
+    fixture_prompt = str(fixture.get("prompt", "")).strip()
+    prompt_matches_fixture = None
+    if prompt_text:
+        prompt_matches_fixture = prompt_text == fixture_prompt
+
+    spec = fixture["spec"]
+    validation = _validate_spec_or_exit(spec)
+    replay_calls = _build_replay_calls(
+        fixture_calls=fixture["llm_calls"],
+        session=session,
+        step=step,
+        replay_fixture=replay_fixture,
+    )
+    _overwrite_jsonl(llm_log_path, replay_calls)
+    llm_summary = aggregate_llm_calls(llm_log_path, session=session)
+
+    telemetry_payload = {
+        "metric_type": "spec_from_prompt",
+        "mode": "replay",
+        "session": session,
+        "step": step,
+        "prompt_text": fixture_prompt if not prompt_text else prompt_text,
+        "prompt_matches_fixture": prompt_matches_fixture,
+        "replay_fixture": str(replay_fixture),
+        "llm_calls": replay_calls,
+        "llm_calls_sha256": _sha256_json(replay_calls),
+        "llm_summary": llm_summary,
+        "spec_sha256": _sha256_json(spec),
+        "schema_validation_pass": validation.get("schema_validation_pass"),
+        "schema_error_count": validation.get("schema_error_count"),
+        "schema_error_types": validation.get("schema_error_types"),
+        "notes": [
+            "Replay mode writes deterministic spec and telemetry outputs for reproducible audits.",
+        ],
+    }
+    return spec, telemetry_payload
+
+
+def _session_slug(session: str) -> str:
+    return slug_to_path(session.lower().replace(" ", "-"))
+
+
 def main() -> None:
     parser = _build_parser()
     args = parser.parse_args()
+
+    if args.cmd == "spec-from-prompt":
+        prompt_text = _load_prompt_text(args.prompt, args.prompt_file)
+        if args.mode == "live":
+            raise SystemExit(
+                "Live LLM mode is not configured in this prototype. Use --mode replay with --replay-fixture."
+            )
+        if not args.replay_fixture:
+            raise SystemExit("--replay-fixture is required when --mode replay.")
+
+        spec, telemetry_payload = _generate_spec_from_replay(
+            prompt_text=prompt_text,
+            replay_fixture=args.replay_fixture,
+            session=args.session,
+            step=args.step,
+            llm_log_path=args.llm_log,
+        )
+        dump_json(args.out_spec, spec)
+        dump_json(args.out_telemetry, telemetry_payload)
+        print(f"Spec generated from replay fixture: {args.out_spec}")
+        print(f"Deterministic telemetry written: {args.out_telemetry}")
+        print(f"LLM calls JSONL (overwritten): {args.llm_log}")
+        return
+
+    if args.cmd == "run-case":
+        if args.page_multiplier < 1:
+            raise SystemExit("--page-multiplier must be >= 1.")
+        prompt_text = _load_prompt_text(args.prompt, args.prompt_file)
+        if args.mode == "live":
+            raise SystemExit(
+                "Live LLM mode is not configured in this prototype. Use --mode replay with --replay-fixture."
+            )
+        if not args.replay_fixture:
+            raise SystemExit("--replay-fixture is required when --mode replay.")
+
+        session_slug = _session_slug(args.session)
+        reports_dir = args.reports_dir
+        spec_path = reports_dir / f"{session_slug}_generated_spec.json"
+        telemetry_path = reports_dir / f"{session_slug}_replay_telemetry.json"
+        llm_log_path = reports_dir / f"{session_slug}_llm_calls.jsonl"
+        scaffold_manifest_path = reports_dir / f"{session_slug}_scaffold.json"
+        build_path = reports_dir / f"{session_slug}_build.json"
+        runtime_path = reports_dir / f"{session_slug}_runtime.json"
+        report_json_path = reports_dir / f"{session_slug}_report.json"
+        report_md_path = reports_dir / f"{session_slug}_report.md"
+        manifest_path = reports_dir / f"{session_slug}_case_run_manifest.json"
+
+        spec, telemetry = _generate_spec_from_replay(
+            prompt_text=prompt_text,
+            replay_fixture=args.replay_fixture,
+            session=args.session,
+            step="spec_generation",
+            llm_log_path=llm_log_path,
+        )
+        dump_json(spec_path, spec)
+        dump_json(telemetry_path, telemetry)
+
+        selected_ssg = args.ssg or str((spec.get("ssg") or {}).get("preferred", "hugo")).lower()
+        if selected_ssg not in SUPPORTED_SSGS:
+            raise SystemExit(f"Unsupported selected SSG: {selected_ssg}")
+
+        project_dir = args.out_root / f"{session_slug}_{selected_ssg}"
+        scaffold_result = scaffold_project(
+            spec=spec,
+            out_dir=project_dir,
+            ssg=selected_ssg,
+            force=args.force,
+            spec_base_dir=args.replay_fixture.parent,
+            page_multiplier=args.page_multiplier,
+        )
+        dump_json(scaffold_manifest_path, scaffold_result)
+
+        build_command = args.build_command or DEFAULT_BUILD_COMMANDS[selected_ssg]
+        build_shell = False
+        eleventy_setup: dict[str, Any] | None = None
+        if selected_ssg == "eleventy":
+            npm_diag = _resolve_npm_diagnostics()
+            eleventy_setup = _ensure_eleventy_dependencies(project_dir, npm_diag)
+            invocation = _resolve_compare_build_invocation(selected_ssg, project_dir, npm_diag)
+            build_command = str(invocation["command"])
+            build_shell = bool(invocation["shell"])
+
+        build_metric = run_build_measurement(
+            command=build_command,
+            project_dir=project_dir,
+            cpu_watt_assumption=args.system_watts,
+            shell=build_shell,
+            ssg=selected_ssg,
+            artifact_dir=args.artifact_dir,
+            capture_full_output=(selected_ssg == "eleventy"),
+        )
+        if eleventy_setup is not None:
+            build_metric["eleventy_setup"] = {
+                "executed": bool(eleventy_setup.get("executed")),
+                "exit_code": int(eleventy_setup.get("exit_code", 0)),
+                "stdout_tail": str(eleventy_setup.get("stdout", ""))[-2500:],
+                "stderr_tail": str(eleventy_setup.get("stderr", ""))[-2500:],
+                "resolved_executable": eleventy_setup.get("resolved_executable"),
+            }
+        dump_json(build_path, build_metric)
+
+        if args.artifact_dir is not None:
+            runtime_artifact_dir = (
+                args.artifact_dir if args.artifact_dir.is_absolute() else (project_dir / args.artifact_dir)
+            )
+        else:
+            runtime_artifact_dir = _artifact_dir_for_ssg(project_dir, selected_ssg)
+
+        if runtime_artifact_dir.exists() and runtime_artifact_dir.is_dir():
+            runtime_metric = measure_runtime_comparison(
+                static_url=None,
+                dynamic_url=None,
+                static_dir=runtime_artifact_dir,
+                dynamic_local=True,
+                runs=args.runtime_runs,
+                timeout_sec=args.timeout_sec,
+            )
+        else:
+            runtime_metric = {
+                "metric_type": "runtime",
+                "measured_at_utc": now_iso(),
+                "mode": {
+                    "static_source": "local_dir",
+                    "dynamic_source": "local_dynamic_server",
+                },
+                "static": None,
+                "dynamic": None,
+                "comparison": None,
+                "notes": [
+                    f"Runtime measurement skipped because artifact directory was not found: {runtime_artifact_dir}"
+                ],
+            }
+        dump_json(runtime_path, runtime_metric)
+
+        llm_summary = aggregate_llm_calls(llm_log_path, session=args.session)
+        combined = combine_report(
+            spec=spec,
+            scaffold=scaffold_result,
+            build=build_metric,
+            runtime=runtime_metric,
+            llm=llm_summary,
+            compare=None,
+            workflow_mode="single_ssg",
+        )
+        md = render_markdown_summary(combined)
+        dump_json(report_json_path, combined)
+        report_md_path.parent.mkdir(parents=True, exist_ok=True)
+        report_md_path.write_text(md, encoding="utf-8")
+
+        manifest = {
+            "metric_type": "case_run_manifest",
+            "workflow_mode": "single_ssg",
+            "session": args.session,
+            "selected_ssg": selected_ssg,
+            "schema_validation_pass": telemetry.get("schema_validation_pass"),
+            "schema_error_count": telemetry.get("schema_error_count"),
+            "schema_error_types": telemetry.get("schema_error_types"),
+            "paths": {
+                "spec": str(spec_path),
+                "telemetry": str(telemetry_path),
+                "llm_log": str(llm_log_path),
+                "scaffold": str(scaffold_manifest_path),
+                "build": str(build_path),
+                "runtime": str(runtime_path),
+                "report_json": str(report_json_path),
+                "report_md": str(report_md_path),
+                "project_dir": str(project_dir),
+            },
+            "notes": [
+                "Single-SSG run-case flow completed.",
+                "Use compare-ssg separately for evaluation-mode multi-SSG ranking.",
+            ],
+        }
+        dump_json(manifest_path, manifest)
+        print(f"Run-case completed for session `{args.session}`.")
+        print(f"Case manifest: {manifest_path}")
+        print(f"Report JSON: {report_json_path}")
+        print(f"Report Markdown: {report_md_path}")
+        return
 
     if args.cmd == "scaffold":
         if args.page_multiplier < 1:
             raise SystemExit("--page-multiplier must be >= 1.")
         spec = load_spec(args.spec)
+        _validate_spec_or_exit(spec)
         selected_ssg = args.ssg or str((spec.get("ssg") or {}).get("preferred", "hugo")).lower()
         result = scaffold_project(
             spec=spec,
@@ -404,6 +787,7 @@ def main() -> None:
         if args.page_multiplier < 1:
             raise SystemExit("--page-multiplier must be >= 1.")
         spec = load_spec(args.spec)
+        _validate_spec_or_exit(spec)
         candidates = ((spec.get("ssg") or {}).get("candidates")) or []
         if not candidates:
             raise SystemExit("Spec has no ssg.candidates list.")
@@ -603,12 +987,22 @@ def main() -> None:
 
     if args.cmd == "report":
         spec = load_spec(args.spec) if args.spec else None
+        if spec is not None:
+            _validate_spec_or_exit(spec)
         scaffold = _maybe_load(args.scaffold)
         build = _maybe_load(args.build)
         runtime = _maybe_load(args.runtime)
+        compare = _maybe_load(args.compare)
         llm = aggregate_llm_calls(args.llm_log, session=args.session) if args.llm_log else None
 
-        combined = combine_report(spec=spec, scaffold=scaffold, build=build, runtime=runtime, llm=llm)
+        combined = combine_report(
+            spec=spec,
+            scaffold=scaffold,
+            build=build,
+            runtime=runtime,
+            llm=llm,
+            compare=compare,
+        )
         md = render_markdown_summary(combined)
         dump_json(args.out_json, combined)
         args.out_md.parent.mkdir(parents=True, exist_ok=True)

@@ -38,19 +38,20 @@ If `pip install -e .` fails with temp/permission errors on Windows, use Option A
 python -m ssg_case_tool.cli -h
 ```
 
-2. Generate a scaffold (portfolio scenario):
+2. Generate a structured spec + deterministic replay telemetry from an informal prompt:
 ```powershell
-python -m ssg_case_tool.cli scaffold --spec scenarios/portfolio_migration.json --out demos/portfolio_hugo --ssg hugo --manifest reports/portfolio_scaffold.json --force
+python -m ssg_case_tool.cli spec-from-prompt --mode replay --replay-fixture scenarios/replay/portfolio_prompt_replay.json --session portfolio --prompt "I need a simple academic portfolio site with Home, About, Projects, and Contact. Keep placeholders only and prepare it for static hosting." --out-spec reports/portfolio_generated_spec.json --out-telemetry reports/portfolio_replay_telemetry.json --llm-log reports/llm_calls.jsonl
+```
+The command validates schema as a strict gate (`schema_validation_pass`, `schema_error_count`, `schema_error_types`). If invalid, it fails early.
+
+3. Generate a scaffold from the generated spec:
+```powershell
+python -m ssg_case_tool.cli scaffold --spec reports/portfolio_generated_spec.json --out demos/portfolio_hugo --ssg hugo --manifest reports/portfolio_scaffold.json --force
 ```
 
-3. Confirm generated project files:
+4. Confirm generated project files:
 ```powershell
 Get-ChildItem -Recurse demos/portfolio_hugo
-```
-
-4. Log one LLM call proxy row:
-```powershell
-python -m ssg_case_tool.cli record-llm --log reports/llm_calls.jsonl --session portfolio --step scaffold --model gpt-4.1 --prompt-tokens 1200 --completion-tokens 300
 ```
 
 5. Measure a build command:
@@ -90,9 +91,9 @@ python -m ssg_case_tool.cli measure-runtime --static-dir demos/portfolio_hugo/pu
 
 The command starts temporary local servers on random free ports, runs latency/TTFB/transfer tests, and shuts servers down automatically.
 
-7. Generate combined report:
+7. Generate combined report (single SSG path):
 ```powershell
-python -m ssg_case_tool.cli report --spec scenarios/portfolio_migration.json --scaffold reports/portfolio_scaffold.json --build reports/portfolio_build.json --runtime reports/portfolio_runtime.json --llm-log reports/llm_calls.jsonl --session portfolio --out-json reports/portfolio_report.json --out-md reports/portfolio_report.md
+python -m ssg_case_tool.cli report --spec reports/portfolio_generated_spec.json --scaffold reports/portfolio_scaffold.json --build reports/portfolio_build.json --runtime reports/portfolio_runtime.json --llm-log reports/llm_calls.jsonl --session portfolio --out-json reports/portfolio_report.json --out-md reports/portfolio_report.md
 ```
 
 8. Review report outputs:
@@ -108,23 +109,37 @@ python -m ssg_case_tool.cli compare-ssg --spec scenarios/portfolio_migration.jso
 `compare-ssg` enforces clean builds: it removes the expected artifact directory before each run, verifies deletion, and marks runs invalid if the artifact is missing or unchanged after build.
 For Eleventy in `compare-ssg`, the tool runs in the Eleventy scaffold directory, executes `npm install` when `node_modules` is missing, uses `npm run build`, captures full stdout/stderr, and records stderr in JSON when build/setup fails.
 Ranking uses median energy proxy (`joules`) as primary and artifact size as secondary; CPU seconds are retained for reference only.
+To include multi-SSG evaluation in the combined report:
+```powershell
+python -m ssg_case_tool.cli report --spec reports/portfolio_generated_spec.json --scaffold reports/portfolio_scaffold.json --build reports/portfolio_build.json --runtime reports/portfolio_runtime.json --compare reports/ssg_compare.json --llm-log reports/llm_calls.jsonl --session portfolio --out-json reports/portfolio_report.json --out-md reports/portfolio_report.md
+```
 
 To scale workload, use synthetic page expansion:
 ```powershell
 python -m ssg_case_tool.cli compare-ssg --spec scenarios/portfolio_migration.json --page-multiplier 10 --runs 5 --out reports/ssg_compare.json --out-root demos/compare --force
 ```
 
+10. One-command single-SSG run (prompt -> spec -> scaffold -> build -> runtime -> report):
+```powershell
+python -m ssg_case_tool.cli run-case --session portfolio_run --mode replay --replay-fixture scenarios/replay/portfolio_prompt_replay.json --prompt "I need a simple academic portfolio site with Home, About, Projects, and Contact. Keep placeholders only and prepare it for static hosting." --ssg hugo --force
+```
+This command also writes `reports/portfolio_run_case_run_manifest.json`.
+
 ## Quick command examples
 ```powershell
 python -m ssg_case_tool.cli scaffold --spec scenarios/portfolio_migration.json --out demos/portfolio_hugo --ssg hugo
+python -m ssg_case_tool.cli spec-from-prompt --mode replay --replay-fixture scenarios/replay/portfolio_prompt_replay.json --session portfolio --out-spec reports/portfolio_generated_spec.json --out-telemetry reports/portfolio_replay_telemetry.json --llm-log reports/llm_calls.jsonl
+python -m ssg_case_tool.cli run-case --session portfolio_run --mode replay --replay-fixture scenarios/replay/portfolio_prompt_replay.json --prompt "I need a simple academic portfolio site with Home, About, Projects, and Contact. Keep placeholders only and prepare it for static hosting." --ssg hugo --force
 python -m ssg_case_tool.cli record-llm --log reports/llm_calls.jsonl --session portfolio --step scaffold --model gpt-4.1 --prompt-tokens 1200 --completion-tokens 300
 python -m ssg_case_tool.cli measure-build --project demos/portfolio_hugo --ssg hugo --out reports/portfolio_build.json
 python -m ssg_case_tool.cli measure-runtime --static-url https://example-static.site --dynamic-url https://example-dynamic.site --runs 5 --out reports/portfolio_runtime.json
 python -m ssg_case_tool.cli measure-runtime --static-dir demos/portfolio_hugo/public --dynamic-local --runs 5 --out reports/portfolio_runtime_local.json
-python -m ssg_case_tool.cli report --spec scenarios/portfolio_migration.json --build reports/portfolio_build.json --runtime reports/portfolio_runtime.json --llm-log reports/llm_calls.jsonl --session portfolio --out-json reports/portfolio_report.json --out-md reports/portfolio_report.md
+python -m ssg_case_tool.cli report --spec reports/portfolio_generated_spec.json --build reports/portfolio_build.json --runtime reports/portfolio_runtime.json --llm-log reports/llm_calls.jsonl --session portfolio --out-json reports/portfolio_report.json --out-md reports/portfolio_report.md
 ```
 
 ## CLI overview
+- `spec-from-prompt`: generate structured spec + deterministic replay telemetry from an informal prompt.
+- `run-case`: one-command single-SSG pipeline (prompt->spec->scaffold->build->runtime->report).
 - `scaffold`: generate SSG project structure/config/templates/placeholders.
 - `measure-build`: run build command and log wall time, CPU time, energy proxy.
 - `record-llm`: append one LLM call record (tokens/call count proxy).
@@ -134,6 +149,9 @@ python -m ssg_case_tool.cli report --spec scenarios/portfolio_migration.json --b
 ## Notes
 - Build energy uses a clearly labeled proxy: `energy_seconds * assumed_system_watts`.
 - If `cpu_seconds` is `0` or unavailable, `energy_basis` switches to `wall_time_seconds`.
+- Replay mode (`spec-from-prompt --mode replay`) is deterministic for generated spec and telemetry artifacts when using the same fixture.
+- `run-case` writes `case_run_manifest.json` and report `workflow_mode`.
+- Report sections use full-stack naming: `llm_usage_proxy`, `build_and_runtime_proxy`, and optional `multi_ssg_evaluation`.
 - Runtime comparison is network-level proxy (latency + transfer bytes), not full RAPL hardware power telemetry.
 - For Windows/macOS/Linux energy telemetry, extend `instrumentation.py` with platform tools.
 - Zola scaffolds automatically run `zola check` after generation and fail early if invalid.

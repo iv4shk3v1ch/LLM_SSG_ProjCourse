@@ -11,15 +11,29 @@ def combine_report(
     build: dict[str, Any] | None = None,
     runtime: dict[str, Any] | None = None,
     llm: dict[str, Any] | None = None,
+    compare: dict[str, Any] | None = None,
+    workflow_mode: str | None = None,
 ) -> dict[str, Any]:
     runtime_insights = _derive_runtime_insights(runtime)
+    effective_workflow_mode = workflow_mode or ("evaluation_compare" if compare else "single_ssg")
+    build_runtime_proxy = {
+        "build": build,
+        "runtime": runtime,
+        "runtime_environment": runtime_insights.get("runtime_environment"),
+        "runtime_warning": runtime_insights.get("warning"),
+        "runtime_summary": runtime_insights.get("summary"),
+    }
     return {
         "report_generated_at_utc": now_iso(),
+        "workflow_mode": effective_workflow_mode,
         "runtime_environment": runtime_insights.get("runtime_environment"),
         "runtime_warning": runtime_insights.get("warning"),
         "runtime_summary": runtime_insights.get("summary"),
         "spec": spec,
         "scaffold": scaffold,
+        "llm_usage_proxy": llm,
+        "build_and_runtime_proxy": build_runtime_proxy,
+        "multi_ssg_evaluation": compare if compare else None,
         "measurements": {
             "build": build,
             "runtime": runtime,
@@ -31,27 +45,32 @@ def combine_report(
 def render_markdown_summary(report: dict[str, Any]) -> str:
     spec = report.get("spec") or {}
     site = spec.get("site") or {}
-    build = ((report.get("measurements") or {}).get("build")) or {}
-    runtime = ((report.get("measurements") or {}).get("runtime")) or {}
-    llm = ((report.get("measurements") or {}).get("llm")) or {}
+    workflow_mode = str(report.get("workflow_mode", "single_ssg"))
+    build_runtime_proxy = report.get("build_and_runtime_proxy") or {}
+    build = (build_runtime_proxy.get("build")) or ((report.get("measurements") or {}).get("build")) or {}
+    runtime = (build_runtime_proxy.get("runtime")) or ((report.get("measurements") or {}).get("runtime")) or {}
+    llm = (report.get("llm_usage_proxy")) or ((report.get("measurements") or {}).get("llm")) or {}
+    compare = report.get("multi_ssg_evaluation")
     energy_proxy = (build.get("energy_proxy") or {}) if build else {}
     artifact = (build.get("build_artifact") or {}) if build else {}
     static_summary = ((runtime.get("static") or {}).get("summary") or {}) if runtime else {}
     dynamic = runtime.get("dynamic") if runtime else None
     dynamic_summary = (dynamic.get("summary") or {}) if dynamic else {}
-    runtime_environment = report.get("runtime_environment", "unknown")
-    runtime_warning = report.get("runtime_warning")
-    runtime_summary = report.get("runtime_summary") or {}
+    runtime_environment = build_runtime_proxy.get("runtime_environment", report.get("runtime_environment", "unknown"))
+    runtime_warning = build_runtime_proxy.get("runtime_warning", report.get("runtime_warning"))
+    runtime_summary = build_runtime_proxy.get("runtime_summary", report.get("runtime_summary")) or {}
 
     lines = [
         "# SSG Case-Study Run Summary",
+        "",
+        f"- Workflow mode: {workflow_mode}",
         "",
         "## Site",
         f"- Name: {site.get('name', 'N/A')}",
         f"- Type: {site.get('type', 'N/A')}",
         f"- Deployment target: {site.get('deployment_target', 'N/A')}",
         "",
-        "## Build Metrics",
+        "## Build and Runtime Proxy",
         f"- Build command: {build.get('command', 'N/A')}",
         f"- Exit code: {build.get('exit_code', 'N/A')}",
         f"- Wall time (s): {_fmt_num(build.get('wall_seconds'))}",
@@ -91,6 +110,19 @@ def render_markdown_summary(report: dict[str, Any]) -> str:
         )
     if runtime_warning:
         lines.append(f"- Runtime warning: {runtime_warning}")
+
+    if compare:
+        ranked = compare.get("ranked") or []
+        lines.extend(
+            [
+                "",
+                "## Multi-SSG Evaluation",
+                f"- Runs per SSG: {_fmt_num(compare.get('runs_per_ssg'))}",
+                f"- Ranking primary: {(compare.get('ranking_policy') or {}).get('primary', 'N/A')}",
+                f"- Ranking secondary: {(compare.get('ranking_policy') or {}).get('secondary', 'N/A')}",
+                f"- Ranked candidates: {_fmt_num(len(ranked))}",
+            ]
+        )
 
     lines.extend(
         [
